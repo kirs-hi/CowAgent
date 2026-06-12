@@ -1151,6 +1151,7 @@ class WebChannel(ChatChannel):
             '/api/sessions/(.*)/clear_context', 'SessionClearContextHandler',
             '/api/sessions/(.*)', 'SessionDetailHandler',
             '/api/history', 'HistoryHandler',
+            '/api/prompt/optimize', 'PromptOptimizeHandler',
             '/api/messages/delete', 'MessageDeleteHandler',
             '/api/logs', 'LogsHandler',
             '/api/version', 'VersionHandler',
@@ -3924,6 +3925,38 @@ class SessionTitleHandler:
             return json.dumps({"status": "success", "title": title}, ensure_ascii=False)
         except Exception as e:
             logger.error(f"[WebChannel] Title generation error: {e}")
+            return json.dumps({"status": "error", "message": str(e)})
+
+
+class PromptOptimizeHandler:
+    """POST /api/prompt/optimize — rewrite a raw user input into a structured
+    instruction using the current chat model (issue #2824).
+
+    Request body: {"text": "...", "context": [{"role","content"}, ...]}
+    Always returns 200 with an "optimized" field; on any backend failure the
+    original text is echoed back so the frontend never blocks the user.
+    """
+    def POST(self):
+        _require_auth()
+        web.header('Content-Type', 'application/json; charset=utf-8')
+        try:
+            body = json.loads(web.data() or "{}")
+            text = (body.get("text") or "").strip()
+            if not text:
+                return json.dumps({"status": "error", "message": "text required"})
+
+            context = body.get("context") or []
+            if not isinstance(context, list):
+                context = []
+
+            from agent.chat.session_service import optimize_prompt
+            optimized = optimize_prompt(text, context)
+            return json.dumps(
+                {"status": "success", "optimized": optimized},
+                ensure_ascii=False,
+            )
+        except Exception as e:
+            logger.error(f"[WebChannel] Prompt optimize error: {e}")
             return json.dumps({"status": "error", "message": str(e)})
 
 

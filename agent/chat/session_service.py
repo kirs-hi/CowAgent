@@ -76,6 +76,91 @@ def generate_session_title(user_message: str, assistant_reply: str = "") -> str:
     return fallback
 
 
+_OPTIMIZE_SYSTEM_PROMPT = (
+    "You are a prompt-optimization assistant. Rewrite the user's raw, colloquial "
+    "input into a clear, structured instruction for an AI assistant, while strictly "
+    "preserving the user's original intent. Rules:\n"
+    "1. Remove filler words, redundancy and hesitation; keep it concise.\n"
+    "2. Make implicit requirements explicit using the conversation context when helpful, "
+    "but NEVER invent, add or drop requirements the user did not express.\n"
+    "3. Normalize casual wording into standard, professional terminology.\n"
+    "4. Reply in the SAME language as the user's input.\n"
+    "5. Output ONLY the optimized instruction text — no quotes, no explanations, "
+    "no preamble, no markdown fences."
+)
+
+
+def optimize_prompt(user_input: str, context_messages=None) -> str:
+    """
+    Rewrite a raw, colloquial user input into a clearer, structured instruction
+    by calling the current chat bot. Implements issue #2824.
+
+    The conversation is fed as: an optimization system prompt, optional recent
+    context turns (for context-aware enhancement), and the raw input to rewrite.
+
+    Falls back to returning the original ``user_input`` unchanged whenever the
+    LLM call fails, returns an error sentinel (completion_tokens<=0), or yields
+    an empty / overly long result — so the caller's send flow is never broken.
+
+    :param user_input: the raw text typed by the user.
+    :param context_messages: optional list of recent ``{"role", "content"}`` dicts
+        providing conversation context. Only the last few are used.
+    :return: the optimized instruction, or the original input on any failure.
+    """
+    original = (user_input or "").strip()
+    if not original:
+        return original
+    try:
+        from bridge.bridge import Bridge
+        from models.session_manager import Session
+        bot = Bridge().get_bot("chat")
+
+        session = Session("__prompt_optimize__", system_prompt=_OPTIMIZE_SYSTEM_PROMPT)
+        messages = [{"role": "system", "content": _OPTIMIZE_SYSTEM_PROMPT}]
+
+        # Include a little recent context so implicit references can be resolved.
+        if context_messages:
+            for msg in context_messages[-4:]:
+                role = msg.get("role")
+                content = (msg.get("content") or "").strip()
+                if role in ("user", "assistant") and content:
+                    messages.append({"role": role, "content": content[:500]})
+
+        messages.append({
+            "role": "user",
+            "content": (
+                "Optimize the following input into a structured instruction. "
+                "Output only the optimized text:\n\n" + original
+            ),
+        })
+        session.messages = messages
+
+        result = bot.reply_text(session) or {}
+        completion_tokens = result.get("completion_tokens", 0) or 0
+        raw = (result.get("content") or "").strip()
+        if completion_tokens <= 0:
+            logger.warning(
+                f"[SessionService] Prompt optimize got empty completion "
+                f"(completion_tokens={completion_tokens}, content='{raw[:50]}'), "
+                f"returning original")
+            return original
+
+        optimized = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+        optimized = optimized.strip('"\'').strip()
+        # Guard against pathological outputs (empty, or absurdly long blowups).
+        if not optimized or len(optimized) > max(2000, len(original) * 8):
+            logger.warning(
+                f"[SessionService] Prompt optimize result rejected "
+                f"(len={len(optimized)}), returning original")
+            return original
+        logger.info(
+            f"[SessionService] Prompt optimized: {len(original)} -> {len(optimized)} chars")
+        return optimized
+    except Exception as e:
+        logger.warning(f"[SessionService] Prompt optimize failed: {e}")
+        return original
+
+
 class SessionService:
     """
     High-level service for session lifecycle management.
